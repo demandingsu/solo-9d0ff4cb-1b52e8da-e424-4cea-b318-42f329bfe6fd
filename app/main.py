@@ -11,9 +11,12 @@ from sqlite3 import Connection
 from . import db
 from .config import DB_PATH, WORKER_THREADS
 from .models import (
+    CurrentMergeOut,
     CurrentResultOut,
     GenerationOut,
     HealthOut,
+    MergeJobOut,
+    MergeRequest,
     NewDistrictSubmission,
     OldGridSubmission,
     VersionOut,
@@ -41,8 +44,10 @@ app = FastAPI(
         "整版提交旧网格（编号、整数矩形、户数）与新片区（编号、整数矩形），"
         "按重叠面积以最大余数法逐格分摊户数并守恒总户数。"
         "生成任务固定提交时刻的版本快照，生成期间可继续替换任一输入。"
+        "另支持片区合并供数：对当前已发布结果按共边连通关系把片区合并为"
+        "达到最低户数的最优化分组，结果绑定源生成任务并原子发布。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -172,3 +177,59 @@ def get_current_result(conn: Connection = Depends(get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="尚无已发布的生成结果")
     return result
+
+
+@app.post(
+    "/merges",
+    response_model=MergeJobOut,
+    status_code=202,
+    tags=["片区合并供数"],
+)
+def create_merge(payload: MergeRequest, conn: Connection = Depends(get_db)):
+    """发起一次片区合并供数。
+
+    以**当前已发布结果**的片区矩形和户数为输入，在本请求事务内固定其生成任务 id；
+    后台按共边连通关系分组，使每组总户数达到 min_households，并最大化组数。
+    无解时任务落为 failed 并说明原因，不发布任何部分结果。
+    """
+    try:
+        with conn:
+            job_id = db.create_merge_job(payload.min_households, conn)
+    except db.ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except db.NoResultError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    assert _executor is not None
+    _executor.submit(db.run_merge_job, job_id, DB_PATH)
+    return db.get_merge_job(job_id, conn)
+
+
+@app.get("/merges", response_model=list[MergeJobOut], tags=["片区合并供数"])
+def list_merge_jobs(conn: Connection = Depends(get_db)):
+    """列出全部合并任务（含失败原因与 stale 标记）。"""
+    return db.list_merge_jobs(conn)
+
+
+@app.get("/merges/{job_id}", response_model=MergeJobOut, tags=["片区合并供数"])
+def get_merge_job(
+    job_id: int = PathParam(..., ge=1), conn: Connection = Depends(get_db)
+):
+    """查询单个合并任务；stale=true 表示源结果已被替换，该合并版不得当作新版供应。"""
+    view = db.get_merge_job(job_id, conn)
+    if view is None:
+        raise HTTPException(status_code=404, detail=f"合并任务 {job_id} 不存在")
+    return view
+
+
+@app.get("/merge-result", response_model=CurrentMergeOut, tags=["片区合并供数"])
+def get_current_merge(conn: Connection = Depends(get_db)):
+    """当前供数的合并版（绑定其源生成任务）。
+
+    若源结果已被新发布结果替换，响应中 stale=true：旧合并版仅作历史保留，
+    不能当作新版供应；需对新结果重新发起合并，重算成功后这里才供应新版。
+    从未成功合并过时返回 404。
+    """
+    view = db.get_current_merge(conn)
+    if view is None:
+        raise HTTPException(status_code=404, detail="尚无成功发布的合并供数结果")
+    return view

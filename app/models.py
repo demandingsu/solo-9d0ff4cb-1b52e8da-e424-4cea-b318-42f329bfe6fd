@@ -151,6 +151,44 @@ class CurrentResultOut(BaseModel):
     districts: list[DistrictSummaryOut]
 
 
+class MergeRequest(BaseModel):
+    """统计员发起片区合并供数时设定的最低户数。"""
+
+    min_households: int = Field(
+        ..., ge=1, description="每个合并组必须达到的最低户数（正整数）"
+    )
+
+
+class MergeGroupOut(BaseModel):
+    """一个合并组：组成片区编号（组内按编号升序）与组内总户数。"""
+
+    group_seq: int
+    households: int
+    district_ids: list[str]
+
+
+class MergeJobOut(BaseModel):
+    """合并任务视图。"""
+
+    id: int
+    status: Literal["pending", "running", "succeeded", "failed"]
+    source_generation_id: int
+    min_households: int
+    stale: bool
+    error: str | None
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    groups: list[MergeGroupOut] | None
+
+
+class CurrentMergeOut(MergeJobOut):
+    """当前供数的合并版，额外带发布时间与总户数。"""
+
+    published_at: str
+    total_households: int
+
+
 class HealthOut(BaseModel):
     status: str
     db: str
